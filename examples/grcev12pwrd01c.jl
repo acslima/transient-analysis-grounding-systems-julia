@@ -195,7 +195,7 @@ function main()
     nf = 100;
     freq = exp10.(range(2, stop=7, length=nf));   # logspace, up to 1e7 Hz
     Lmax = 1.0;
-    mhem = true;       # set true for the modified-HEM formulation
+    mhem = false;        # set true for the modified-HEM formulation
     symmetry = true;    # set false to skip the symmetry-exploitation path
     gs_arr = [10, 20, 30, 60, 120];
     ng = length(gs_arr);
