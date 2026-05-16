@@ -122,13 +122,14 @@ function simulate(gs::Int, freq, Lmax, mhem::Bool, symmetry::Bool)
         zlis = [Array{ComplexF64}(undef, (ns,ns)) for t = 1:Threads.nthreads()]
         ztis = [Array{ComplexF64}(undef, (ns,ns)) for t = 1:Threads.nthreads()]
     end
+    # alocate buffers per task, not per thread. This is correct regardless of scheduler, thread pool, or Julia version:
     Threads.@threads for f = 1:nf
         t = Threads.threadid()
-        zl = zls[t]
-        zt = zts[t]
-        ie = ies[t]
-        yn = yns[t]
-        mC = mCs[t]
+        zl = Array{ComplexF64}(undef, (ns,ns))
+        zt = Array{ComplexF64}(undef, (ns,ns))
+        ie = Array{ComplexF64}(undef, nn)
+        yn = Array{ComplexF64}(undef, (nn,nn))
+        mC = Array{ComplexF64}(undef, (ns,nn))
         jw = 1.0im*TWO_PI*freq[f];
         kappa = σ1 + jw*epsr*eps0;
         k1 = sqrt(jw*mu0*kappa);
