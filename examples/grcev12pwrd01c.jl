@@ -192,17 +192,17 @@ function main()
         println("see:\n  https://docs.julialang.org/en/v1/manual/multi-threading/#man-multithreading")
     end
 
-    nf = 100
-    freq = exp10.(range(2, stop=7, length=nf))   # logspace, up to 1e7 Hz
-    Lmax = 1.0
-    mhem = false       # set true for the modified-HEM formulation
-    symmetry = true    # set false to skip the symmetry-exploitation path
-    gs_arr = [10, 20, 30, 60, 120]
-    ng = length(gs_arr)
-    zh = Array{ComplexF64}(undef, nf, ng)
+    nf = 100;
+    freq = exp10.(range(2, stop=7, length=nf));   # logspace, up to 1e7 Hz
+    Lmax = 1.0;
+    mhem = true;       # set true for the modified-HEM formulation
+    symmetry = true;    # set false to skip the symmetry-exploitation path
+    gs_arr = [10, 20, 30, 60, 120];
+    ng = length(gs_arr);
+    zh = Array{ComplexF64}(undef, nf, ng);
     for i = 1:ng
-        gs = gs_arr[i]
-        @time zh[:, i] = simulate(gs, freq, Lmax, mhem, symmetry)
+        gs = gs_arr[i];
+        @time zh[:, i] = simulate(gs, freq, Lmax, mhem, symmetry);
     end
     return freq, zh, gs_arr, ng
 end
