@@ -30,6 +30,7 @@ using LinearAlgebra;
 using HCubature;
 using QuadGK;
 using FFTW
+using SpecialFunctions: besselj
 
 
 const TWO_PI = 6.283185307179586;
@@ -203,12 +204,24 @@ end
 ## HEM
 
 """
-Defines which integration (and simplification thereof) to do.  
-INTG_NONE: no integration is done, it is instead calculated as the distance
-    between the middle points of the conductors.  
-INTG_DOUBLE: performs the normal double integration along each conductor segment.  
-INTG_SINGLE: performs the normal integration along only a single conductor segment.  
-INTG_MHEM: calculates the integral of the modified HEM.
+Defines which integration (and simplification thereof) to do.
+
+INTG_NONE        : no integration, taken as mid-point distance.
+INTG_DOUBLE      : full double integration, free-space kernel exp(-γR)/R.
+INTG_SINGLE      : single integration, mid-point on receiver, free-space.
+INTG_MHEM        : modified HEM (logNf) integrand.
+INTG_MACLAURIN   : MacLaurin-series closed form.
+INTG_PADE        : Padé approximant closed form.
+INTG_DOUBLE_IMG  : double integral, kernel = exp(-γRi)/Ri (image only,
+                    caller applies reflection coefficient externally).
+INTG_DOUBLE_MIMG : double integral, modified-image kernel
+                    exp(-γRi)/Ri (alias used by `impedances_with_kernel!`
+                    when the modified-image reflection coefficient is
+                    selected; identical integrand to INTG_DOUBLE_IMG).
+INTG_SOMM_GA     : Sommerfeld reflection correction for the A-kernel
+                    (TE coefficient).
+INTG_SOMM_GV     : Sommerfeld reflection correction for the V-kernel
+                    (kz1² R_TM + k1² R_TE) / kρ² term.
 """
 @enum Integration_type begin
     INTG_NONE = 1
@@ -217,6 +230,29 @@ INTG_MHEM: calculates the integral of the modified HEM.
     INTG_MHEM = 4
     INTG_MACLAURIN = 5
     INTG_PADE = 6
+    INTG_DOUBLE_IMG = 7
+    INTG_DOUBLE_MIMG = 8
+    INTG_SOMM_GA = 9
+    INTG_SOMM_GV = 10
+end
+
+
+"""
+Half-space kernel selector for high-level `impedances_with_kernel!`.
+
+KERNEL_IMAGE         : single image contribution, reflection coefficient
+                        = -1 (perfect ground) baked in by caller.
+KERNEL_MODIFIED_IMG  : single image contribution with the quasi-static
+                        reflection coefficient
+                        K₁₀ = (ε̂₁ − ε₀)/(ε̂₁ + ε₀).
+KERNEL_RIGOROUS_SOMM : image contribution as in KERNEL_MODIFIED_IMG plus
+                        the Sommerfeld reflection-tail correction for
+                        both the vector (A) and scalar (V) potentials.
+"""
+@enum HalfSpaceKernel begin
+    KERNEL_IMAGE = 1
+    KERNEL_MODIFIED_IMG = 2
+    KERNEL_RIGOROUS_SOMM = 3
 end
 
 
@@ -305,7 +341,7 @@ end
 
 
 """
-Integrand that appears in the double integral between two electrodes.  
+Integrand that appears in the double integral between two electrodes.
     `exp(-γ * r) / r`
 """
 function integrand_double(sender::Electrode, receiver::Electrode, gamma, t)
@@ -316,9 +352,91 @@ function integrand_double(sender::Electrode, receiver::Electrode, gamma, t)
 end
 
 
+# ============================================================================
+# Rigorous Sommerfeld reflection-tail correction
+# ============================================================================
+"""
+Branch-selected square root for k_z = √(k² − k_ρ²) with Im(k_z) ≤ 0,
+so that `exp(-j k_z |Δz|)` decays for evanescent kρ > |k|.
+"""
+@inline function _kz_branch(k, kρ)
+    kz = sqrt(k^2 - kρ^2)
+    return imag(kz) > 0 ? -kz : kz
+end
+
+
+"""
+Sommerfeld reflection-correction integral for a horizontal source–observation
+pair both at depth h below the interface (z = z' = −h).
+
+`kind ∈ (:GA, :GV)` selects the vector- or scalar-potential variant.
+
+    G_A,refl(ρ) = (1/4π) ∫₀^∞  R_TE · exp(-j k_z1 H)/(j k_z1) · J₀(kρ ρ) kρ dkρ
+
+    G_V,refl(ρ) = (1/4π) ∫₀^∞ (k_z1² R_TM + k1² R_TE)/kρ² ·
+                              exp(-j k_z1 H)/(j k_z1) · J₀(kρ ρ) kρ dkρ
+
+The contour is deformed into Q1 to avoid the air-side branch point and
+the Sommerfeld pole, then returns to the real axis where the integrand
+decays like exp(-kρ H).
+"""
+function sommerfeld_corr(kind::Symbol, k0::Complex, k1::Complex,
+                         eps_hat1::Complex, H::Real, rho::Real;
+                         rtol::Float64 = 1e-6)
+    @inline function integrand(kρ)
+        abs(kρ) < 1e-14 && return zero(ComplexF64)
+        kz0 = _kz_branch(k0, kρ)
+        kz1 = _kz_branch(k1, kρ)
+        R_TE = (kz1 - kz0) / (kz1 + kz0)
+        R_TM = (EPS0 * kz1 - eps_hat1 * kz0) /
+               (EPS0 * kz1 + eps_hat1 * kz0)
+        prop = exp(-im * kz1 * H) / (im * kz1) *
+               besselj(0, kρ * rho) * kρ
+        if kind === :GA
+            return R_TE * prop
+        elseif kind === :GV
+            num = kz1^2 * R_TM + k1^2 * R_TE
+            return (num * prop) / kρ^2
+        else
+            error("kind must be :GA or :GV")
+        end
+    end
+    kscale = max(abs(k1), abs(k0), 1.0 / max(H, rho, 1e-3))
+    P0 = kscale * complex(1e-4, 0.0)
+    P1 = kscale * complex(1.5,  0.75)
+    P2 = kscale * complex(3.0,  0.0)
+    decay_len = 1.0 / max(H, 0.01)
+    P3 = complex(max(real(P2) + 40 * decay_len, 20 * kscale), 0.0)
+    I1, _ = quadgk(t -> integrand(P0 + t*(P1-P0)) * (P1-P0), 0.0, 1.0; rtol=rtol)
+    I2, _ = quadgk(t -> integrand(P1 + t*(P2-P1)) * (P2-P1), 0.0, 1.0; rtol=rtol)
+    I3, _ = quadgk(t -> integrand(P2 + t*(P3-P2)) * (P3-P2), 0.0, 1.0; rtol=rtol)
+    return (I1 + I2 + I3) / (4π)
+end
+
+
+"""
+Sommerfeld correction as an integrand for double integration along a pair
+of horizontal electrode segments (both at depth h). `H = 2h_avg` is the
+source-to-image vertical separation, supplied by the caller from the
+underlying geometry.
+"""
+function integrand_sommerfeld_double(kind::Symbol,
+                                     sender::Electrode, receiver::Electrode,
+                                     k0::Complex, k1::Complex,
+                                     eps_hat1::Complex, H::Real, t)
+    point_s = t[1]*(sender.end_point - sender.start_point) + sender.start_point;
+    point_r = t[2]*(receiver.end_point - receiver.start_point) + receiver.start_point;
+    dx = point_s[1] - point_r[1]
+    dy = point_s[2] - point_r[2]
+    rho = sqrt(dx^2 + dy^2)
+    rho < 1e-9 && (rho = 1e-9)
+    return sommerfeld_corr(kind, k0, k1, eps_hat1, H, rho)
+end
+
+
 """
 Integrand that appears in the single integral between a sender electrode and
-the middle point of a receiver electrode. 
+the middle point of a receiver electrode.
     `exp(-γ * r) / r`
 """
 function integrand_single(sender::Electrode, receiver::Electrode, gamma, t)
@@ -455,6 +573,28 @@ function pade(sender, receiver, gamma)
       + (xr0 - 2/γ)*logabs(2 + γ*(xs1 - xr0))
       -  xs1*logabs(2 + γ*(xs1 - xr0)) );
     return -(a + 2b)
+end
+
+
+"""
+Performs the double integral of the Sommerfeld correction for an electrode
+pair both at depth h. `H = 2h_avg` is the source-to-image vertical
+separation. `kind ∈ (:GA, :GV)`. Result has units of length (∫∫ G dl dl').
+"""
+function integral_sommerfeld(kind::Symbol, sender::Electrode,
+                             receiver::Electrode,
+                             k0::Complex, k1::Complex, eps_hat1::Complex,
+                             H::Real;
+                             max_eval=typemax(Int), atol=0,
+                             rtol=sqrt(eps(Float64)), error_norm=norm,
+                             initdiv=1)
+    ls = sender.length
+    lr = receiver.length
+    f(t) = integrand_sommerfeld_double(kind, sender, receiver,
+                                       k0, k1, eps_hat1, H, t)
+    intg, err = hcubature(f, (0., 0.), (1., 1.); rtol=rtol, atol=atol,
+                          maxevals=max_eval, initdiv=initdiv)
+    return intg * ls * lr
 end
 
 
@@ -621,6 +761,131 @@ function impedances_images(electrodes, images, gamma, s, mur, kappa,
                        ref_l, ref_t, max_eval, atol, rtol,
                        error_norm, intg_type, initdiv);
     return zli, zti
+end
+
+
+# ============================================================================
+# High-level half-space kernel selector
+#
+#   KERNEL_IMAGE         : single image, R = -1 (perfect ground).
+#   KERNEL_MODIFIED_IMG  : single image with K10 = (ε̂1 − ε0)/(ε̂1 + ε0).
+#   KERNEL_RIGOROUS_SOMM : K10 image + Sommerfeld tail correction
+#                          (TE for A, TM+TE for V).
+#
+# Assumptions: all electrodes lie at the same depth h below the interface
+# (z = z' = -h). The images list, as in `impedances_images!`, is the
+# mirror image of `electrodes` through z = 0.
+# ============================================================================
+"""
+Build the half-space contribution to the impedance matrices for a chosen
+kernel. Returns `(ZL, ZT)` complete (direct + half-space correction).
+
+`ZL_direct` and `ZT_direct` are the free-space (in-medium) matrices
+produced by `calculate_impedances!` on the real electrodes.
+"""
+function impedances_with_kernel!(zl, zt,
+                                 zl_direct, zt_direct,
+                                 electrodes, images,
+                                 gamma::Complex, s::Complex,
+                                 mur::Real, kappa::Complex,
+                                 eps_hat1::Complex, h_depth::Real,
+                                 kernel::HalfSpaceKernel = KERNEL_MODIFIED_IMG;
+                                 max_eval=typemax(Int), atol=0,
+                                 rtol=sqrt(eps(Float64)), error_norm=norm,
+                                 intg_type=INTG_DOUBLE, initdiv=1)
+
+    # Direct (in-medium) part — already computed by caller.
+    @inbounds for i in eachindex(zl)
+        zl[i] = zl_direct[i]
+        zt[i] = zt_direct[i]
+    end
+
+    EPS0 = 8.854187817620e-12
+    k0   = s / 299_792_458.0     # air wavenumber (γ = jk = s/c for lossless air)
+    # Note: for a sub-soil source, k1 = γ already supplied as `gamma` in the
+    # caller's convention (γ = s·sqrt(μ ε̂1)). We treat it as k1.
+    k1 = gamma * (-im)           # gamma = jk1  ⇒  k1 = -j·gamma; use as-is
+    if kernel === KERNEL_IMAGE
+        ref_l = -1.0 + 0im
+        ref_t = -1.0 + 0im
+        impedances_images!(zl, zt, electrodes, images, gamma, s, mur, kappa,
+                           ref_l, ref_t, max_eval, atol, rtol,
+                           error_norm, intg_type, initdiv)
+    elseif kernel === KERNEL_MODIFIED_IMG
+        K10 = (eps_hat1 - EPS0) / (eps_hat1 + EPS0)
+        impedances_images!(zl, zt, electrodes, images, gamma, s, mur, kappa,
+                           K10, K10, max_eval, atol, rtol,
+                           error_norm, intg_type, initdiv)
+    elseif kernel === KERNEL_RIGOROUS_SOMM
+        # 1) Modified-image image contribution.
+        K10 = (eps_hat1 - EPS0) / (eps_hat1 + EPS0)
+        impedances_images!(zl, zt, electrodes, images, gamma, s, mur, kappa,
+                           K10, K10, max_eval, atol, rtol,
+                           error_norm, intg_type, initdiv)
+        # 2) Sommerfeld reflection-tail correction.
+        H = 2.0 * h_depth
+        iwu_4pi  = s * mur * MU0 / (FOUR_PI)
+        one_4pik = 1.0 / (FOUR_PI * kappa)
+        ns = length(electrodes)
+        Threads.@threads for i = 1:ns
+            v1 = electrodes[i].end_point - electrodes[i].start_point
+            ls = electrodes[i].length
+            for k = i:ns
+                v2 = electrodes[k].end_point - electrodes[k].start_point
+                lr = electrodes[k].length
+                cost = dot(v1, v2) / (ls * lr)
+                intg_GA = integral_sommerfeld(:GA, electrodes[i], electrodes[k],
+                                              k0, k1, eps_hat1, H;
+                                              max_eval=max_eval, atol=atol,
+                                              rtol=rtol, initdiv=initdiv)
+                intg_GV = integral_sommerfeld(:GV, electrodes[i], electrodes[k],
+                                              k0, k1, eps_hat1, H;
+                                              max_eval=max_eval, atol=atol,
+                                              rtol=rtol, initdiv=initdiv)
+                zl[k, i] += iwu_4pi * intg_GA * cost
+                zt[k, i] += one_4pik / (ls * lr) * intg_GV
+            end
+        end
+    else
+        error("unknown HalfSpaceKernel: $kernel")
+    end
+    return zl, zt
+end
+
+
+"""
+Convenience wrapper that allocates `ZL`, `ZT`, computes the direct
+in-medium matrices, and then adds the half-space correction selected by
+`kernel`. Returns the completed `(ZL, ZT)`.
+
+`h_depth` is the burial depth used by `KERNEL_RIGOROUS_SOMM` to form
+H = 2h for the Sommerfeld vertical separation. All electrodes are assumed
+to lie at the same depth `h_depth` (positive number; the image list is the
+geometric mirror through z = 0).
+"""
+function impedances_halfspace(electrodes, images,
+                              gamma::Complex, s::Complex,
+                              mur::Real, kappa::Complex,
+                              eps_hat1::Complex, h_depth::Real,
+                              kernel::HalfSpaceKernel = KERNEL_MODIFIED_IMG;
+                              max_eval=typemax(Int), atol=0,
+                              rtol=sqrt(eps(Float64)), error_norm=norm,
+                              intg_type=INTG_DOUBLE, initdiv=1)
+    ns = length(electrodes)
+    zl_direct = Array{ComplexF64}(undef, ns, ns)
+    zt_direct = Array{ComplexF64}(undef, ns, ns)
+    calculate_impedances!(zl_direct, zt_direct, electrodes, gamma, s, mur,
+                          kappa, max_eval, atol, rtol, error_norm,
+                          intg_type, initdiv)
+    zl = Array{ComplexF64}(undef, ns, ns)
+    zt = Array{ComplexF64}(undef, ns, ns)
+    impedances_with_kernel!(zl, zt, zl_direct, zt_direct,
+                            electrodes, images, gamma, s, mur, kappa,
+                            eps_hat1, h_depth, kernel;
+                            max_eval=max_eval, atol=atol, rtol=rtol,
+                            error_norm=error_norm, intg_type=intg_type,
+                            initdiv=initdiv)
+    return zl, zt
 end
 
 
