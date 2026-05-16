@@ -41,9 +41,9 @@ function simulate(gs::Int, freq, Lmax, mhem::Bool, symmetry::Bool)
     σ1 = 1.0/1000.0;
     # Frequencies
     nf = length(freq);
-    #Ω = 2*pi*freq[nf];
-    #λ = (2*pi/Ω)*(1/sqrt( epsr*eps0*mu0/2*(1 + sqrt(1 + (σ1/(Ω*epsr*eps0))^2)) ));
-
+    Ω = 2*pi*freq[nf];
+    λ = (2*pi/Ω)*(1/sqrt( epsr*eps0*mu0/2*(1 + sqrt(1 + (σ1/(Ω*epsr*eps0))^2)) ));
+    Lmax = min(Lmax, λ/10);
     # Grid
     r = 7e-3;
     h = -0.5;
@@ -197,7 +197,7 @@ function main()
     Lmax = 1.0;
     mhem = true;        # set true for the modified-HEM formulation
     symmetry = true;    # set false to skip the symmetry-exploitation path
-    gs_arr = [10, 20, 30, 60, 120];
+    gs_arr = [10, 20, 30, 60, 90];  # grid sizes to simulate, in [m]
     ng = length(gs_arr);
     zh = Array{ComplexF64}(undef, nf, ng);
     for i = 1:ng
